@@ -22,27 +22,34 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 client = genai.Client(api_key=GOOGLE_API_KEY)
-user_vectorstores = {}
+
+user_data = {} 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Olá! Sou seu Assistente de Manuais.\n"
-        "Envie um PDF para eu ler e depois faça perguntas!"
+        "Olá! Sou seu Assistente Técnico Inteligente.\n"
+        "Envie um manual em PDF (máx 20MB) para começarmos."
     )
 
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Envie um PDF para começar.")
+    await update.message.reply_text("Envie um arquivo PDF para eu analisar.")
 
 async def process_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     document = update.message.document
 
+    if document.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text(
+            "O arquivo é muito grande (maior que 20MB). "
+            "A API do Telegram não permite que bots baixem arquivos desse tamanho diretamente."
+        )
+        return
+
     if document.mime_type != "application/pdf":
         await update.message.reply_text("Apenas arquivos PDF são aceitos.")
         return
 
-    await update.message.reply_text("Processando PDF...")
+    await update.message.reply_text("Baixando e processando PDF... Isso pode levar alguns segundos.")
 
     try:
         file = await context.bot.get_file(document.file_id)
@@ -54,69 +61,93 @@ async def process_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loader = PyPDFLoader(temp_path)
         docs = loader.load()
 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=250)
         chunks = splitter.split_documents(docs)
 
-        embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        embedding_model = HuggingFaceEmbeddings(model_name=model_name)
 
         vectorstore = FAISS.from_documents(chunks, embedding=embedding_model)
 
-        user_vectorstores[user_id] = vectorstore
+        user_data[user_id] = {
+            "vectorstore": vectorstore,
+            "history": []
+        }
 
         os.remove(temp_path)
 
         await update.message.reply_text(
-            f"PDF processado! {len(chunks)} trechos indexados. Pode perguntar!"
+            f"PDF Processado com sucesso!\n"
+            f"{len(chunks)} trechos indexados.\n"
+            f"Pode fazer perguntas!"
         )
 
     except Exception as e:
-        print("Erro ao processar PDF:", e)
-        await update.message.reply_text("Erro ao ler o PDF.")
+        print(f"Erro ao processar PDF: {e}")
+        await update.message.reply_text("Erro ao ler o PDF. Tente um arquivo mais simples ou sem proteção.")
 
 async def handle_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     question = update.message.text
 
-    if user_id not in user_vectorstores:
-        await update.message.reply_text("Envie um PDF primeiro!")
+    if user_id not in user_data:
+        await update.message.reply_text("📂 Por favor, envie um PDF primeiro!")
         return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        vectorstore = user_vectorstores[user_id]
-        retriever = vectorstore.as_retriever()
+        data = user_data[user_id]
+        vectorstore = data["vectorstore"]
+        history = data["history"]
+
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+        history_text = ""
+        for q, a in history[-3:]:
+            history_text += f"Human: {q}\nAI: {a}\n"
 
         def format_docs(docs):
             return "\n\n".join(doc.page_content for doc in docs)
 
         prompt_text = (
-            "Você é um assistente técnico.\n"
-            "Use SOMENTE o contexto extraído do PDF para responder e responda em qualquer idioma solicitado.\n"
-            "Se algo não estiver no manual, diga: 'Não encontrei isso no manual.'\n\n"
-            "Contexto:\n{context}\n\n"
-            "Pergunta: {question}"
+            "Você é um especialista técnico analisando um manual.\n"
+            "Responda à pergunta baseando-se no contexto abaixo e no histórico da conversa.\n"
+            "Se a resposta não estiver no contexto, diga que não encontrou, mas tente inferir com base no histórico se fizer sentido.\n\n"
+            "--- HISTÓRICO DA CONVERSA ---\n"
+            "{history}\n"
+            "------------------------------\n\n"
+            "--- CONTEXTO DO MANUAL ---\n"
+            "{context}\n"
+            "--------------------------\n\n"
+            "Pergunta Atual: {question}"
         )
+        
         prompt = PromptTemplate.from_template(prompt_text)
 
-        rag_chain = (
-            {"context": retriever | format_docs,
-             "question": RunnablePassthrough()}
-            | prompt
-        )
+        docs = retriever.invoke(question)
+        context_str = format_docs(docs)
 
-        full_prompt = rag_chain.invoke(question)
+        full_prompt = prompt.format(
+            history=history_text,
+            context=context_str,
+            question=question
+        )
 
         response = client.models.generate_content(
             model="gemini-2.0-flash-exp",
             contents=full_prompt
         )
+        
+        answer = response.text
 
-        await update.message.reply_text(response.text)
+        user_data[user_id]["history"].append((question, answer))
+
+        await update.message.reply_text(answer)
 
     except Exception as e:
-        print("Erro RAG:", e)
-        await update.message.reply_text("Erro ao gerar resposta.")
+        print(f"Erro RAG: {e}")
+        await update.message.reply_text("Erro ao gerar resposta. Tente reformular.")
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN:
@@ -130,5 +161,5 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.Document.PDF, process_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_questions))
 
-    print("🤖 Bot iniciado! (Ctrl+C para parar)")
+    print("Bot iniciado! (Ctrl+C para parar)")
     app.run_polling()
