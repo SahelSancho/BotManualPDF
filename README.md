@@ -30,9 +30,13 @@ Abra o terminal do VS Code e execute:
 
     Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
-## 3. Ativar o Ambiente Virtual
+## 3. Ativar o Ambiente Virtual CMD
 
     venv\Scripts\activate.bat
+
+## 4. Ativar o Ambiente Virtual PowerShell
+
+    .\venv\Scripts\Activate.ps1
 
 ------------------------------------------------------------------------
 
